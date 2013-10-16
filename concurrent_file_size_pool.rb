@@ -1,7 +1,7 @@
 # Adapted from the Akka/Scala example in Prag Prog's excellent
 # "Programming Concurrency on the JVM"
 #
-# This is mostly a direct translation.
+# This is a more idiomatic implementation using Celluloid's actor pool support.
 
 require 'celluloid/autostart'
 
@@ -11,31 +11,18 @@ class SizeCollector
   attr_reader :total_size, :pending_number_of_files_to_visit
 
   def initialize
-    @idle_file_processors = []
+    @worker_pool = FileProcessor.pool
     @file_names_to_process = []
     @start = Time.now
     @total_size = 0
     @pending_number_of_files_to_visit = 0
   end
 
-  def register_worker(file_processor)
-    @idle_file_processors << file_processor
-    send_a_file_to_process
-  end
-
   def add_file_to_process(file_name)
     puts "Add file: #{file_name}"
     @file_names_to_process << file_name
     @pending_number_of_files_to_visit += 1
-    async.send_a_file_to_process
-  end
-
-  def send_a_file_to_process
-    return if @idle_file_processors.empty? && @file_names_to_process.empty?
-    worker = @idle_file_processors.pop
-    if worker
-      worker.async.process_file(@file_names_to_process.pop.to_s)
-    end
+    send_a_file_to_process
   end
 
   def add_file_size(file_size)
@@ -52,6 +39,12 @@ class SizeCollector
   def done?
     @pending_number_of_files_to_visit == 0
   end
+
+  private
+  
+  def send_a_file_to_process
+    @worker_pool.async.process_file(@file_names_to_process.pop.to_s, Actor.current)
+  end
 end
 
 # FileProcessors are the workers with the job to explore a given directory and
@@ -63,30 +56,19 @@ end
 class FileProcessor
   include Celluloid
 
-  def initialize(size_collector)
-    @size_collector = size_collector
-    register_to_get_file
-  end
-
-  def process_file(file_name)
+  def process_file(file_name, size_collector)
     size = 0
     if File.file?(file_name)
       size = File.size(file_name)
     elsif File.directory?(file_name)
       entries = Dir.glob("#{file_name}/*") + Dir.glob("#{file_name}/.*").reject { |f| f.match(/\.\.?$/) }
-      entries.each { |f| @size_collector.async.add_file_to_process(f) }
+      entries.each { |f| size_collector.async.add_file_to_process(f) }
     else
       return
     end
 
-    @size_collector.async.add_file_size(size)
-    register_to_get_file
+    size_collector.async.add_file_size(size)
     size
-  end
-
-  private
-  def register_to_get_file
-    @size_collector.async.register_worker(Actor.current)
   end
 end
 
@@ -102,8 +84,6 @@ class ConcurrentFileSize
     end
 
     @size_collector.add_file_to_process(ARGV[0])
-
-    5.times { FileProcessor.new(@size_collector) }
 
     until @size_collector.done?
       sleep 1
